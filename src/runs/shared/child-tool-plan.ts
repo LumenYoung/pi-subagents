@@ -191,6 +191,8 @@ export interface ResolvePiLaunchToolPlanInput {
 	 * When provided, child tool plans intersect declared builtin tools with
 	 * this set. Tools the agent declares but the host does not provide are
 	 * omitted with a non-fatal warning (tracked in `unavailableHostBuiltins`).
+	 * Explicit extension tool names are authorized independently; the child's
+	 * required-tool diagnostic checks whether their providers registered them.
 	 * Review/scout lanes fail closed when a requested, still-permitted
 	 * repository inspection tool is among those host omissions. Intentionally
 	 * empty or ceiling-restricted allowlists are not a minimum-tool contract.
@@ -200,6 +202,7 @@ export interface ResolvePiLaunchToolPlanInput {
 
 export interface PiLaunchToolPlan {
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	/** Named tools (including extension tools); these fields exclude provider paths. */
 	requestedBuiltinTools: string[];
 	declaredBuiltinTools: string[];
 	excludeTools: string[];
@@ -339,7 +342,7 @@ export function resolvePermissionSystemExtension(): string | undefined {
 /**
  * Extract the names of builtin tools the host provides. Use this to pass
  * `hostAvailableBuiltins` to `resolvePiLaunchToolPlan` so child tool plans
- * intersect declared agent tools with what the host actually supports.
+ * intersect declared builtin tools with what the host actually supports.
  *
  * Returns `undefined` when builtin tool discovery fails or yields nothing,
  * so callers skip the intersection (fail-safe to allowing all declared tools).
@@ -381,6 +384,14 @@ export function resolvePiLaunchToolPlan(
 			(tool) =>
 				!(tool.includes("/") || tool.endsWith(".ts") || tool.endsWith(".js")),
 		) ?? [];
+	const isExternalTool = (tool: string): boolean =>
+		!PI_BUILTIN_TOOL_NAMES.has(tool) &&
+		!hostAvailableSet?.has(tool) &&
+		!NATIVE_COORDINATION_TOOL_NAMES.has(tool);
+	// The parent builtin menu cannot establish which tools a child provider
+	// registers. Preserve explicit names for SDK authorization and subsequent
+	// required-tool diagnostics; a ceiling alone is not an explicit request.
+	const requestedExtensionTools = new Set(requestedBuiltinTools.filter(isExternalTool));
 	if (input.requireReadTool && hostAvailableSet && !hostAvailableSet.has("read")) {
 		const agentLabel = input.agentName ? ` for agent '${input.agentName}'` : "";
 		throw new Error(
@@ -404,11 +415,14 @@ export function resolvePiLaunchToolPlan(
 					? ["read", ...requestedBuiltinTools]
 					: requestedBuiltinTools
 				).filter((tool) => !allowedToolSet || allowedToolSet.has(tool));
+	const permittedNamedTools = ceilingFilteredBuiltinTools.filter(
+		(tool) => !capabilityCeiling?.denyExtensions || !isExternalTool(tool),
+	);
 	const declaredBuiltinTools = hostAvailableSet
-		? ceilingFilteredBuiltinTools.filter((tool) => hostAvailableSet.has(tool) || NATIVE_COORDINATION_TOOL_NAMES.has(tool))
-		: ceilingFilteredBuiltinTools;
+		? permittedNamedTools.filter((tool) => hostAvailableSet.has(tool) || NATIVE_COORDINATION_TOOL_NAMES.has(tool) || requestedExtensionTools.has(tool))
+		: permittedNamedTools;
 	const unavailableHostBuiltins = hostAvailableSet
-		? ceilingFilteredBuiltinTools.filter((tool) => !hostAvailableSet.has(tool) && !NATIVE_COORDINATION_TOOL_NAMES.has(tool))
+		? permittedNamedTools.filter((tool) => !hostAvailableSet.has(tool) && !NATIVE_COORDINATION_TOOL_NAMES.has(tool) && !requestedExtensionTools.has(tool))
 		: [];
 	const excludeTools = [...new Set((input.excludeTools ?? []).map((tool) => tool.trim()).filter(Boolean))];
 	const excludedToolSet = new Set(excludeTools);

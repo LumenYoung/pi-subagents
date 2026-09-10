@@ -157,6 +157,90 @@ describe("child tool plan host builtin intersection", () => {
 	});
 });
 
+describe("child tool plan explicit extension authorization", () => {
+	const extensionTools = ["compress", "decompress", "search_context", "acp_status", "fixture_lookup"];
+	const provider = "/fixture/provider.ts";
+	const input = { tools: ["read", ...extensionTools], hostAvailableBuiltins: ["read"] };
+
+	it("preserves explicitly named extension tools independently of parent providers", () => {
+		for (const providerInput of [{}, { extensions: [provider] }, { subagentOnlyExtensions: [provider] }, { tools: [...input.tools, provider] }]) {
+			const plan = resolvePiLaunchToolPlan({ ...input, ...providerInput });
+			assert.deepEqual(plan.effectiveToolAllowlist, input.tools);
+			assert.deepEqual(plan.requiredChildTools, input.tools);
+			assert.deepEqual(plan.unavailableHostBuiltins, []);
+			assert.deepEqual(plan.warnings, []);
+			assert.equal(plan.configuredExtensions.includes(provider), Object.keys(providerInput).length > 0);
+		}
+	});
+
+	it("does not mistake a typo for an unavailable host builtin", () => {
+		const plan = resolvePiLaunchToolPlan({ ...input, tools: ["read", "compres", "grep"] });
+		assert.deepEqual(plan.effectiveToolAllowlist, ["read", "compres"]);
+		assert.deepEqual(plan.requiredChildTools, ["read", "compres"]);
+		assert.deepEqual(plan.unavailableHostBuiltins, ["grep"]);
+	});
+
+	it("applies exclusions and intersected ceilings before authorizing extension names", () => {
+		const plan = resolvePiLaunchToolPlan({
+			...input,
+			extensions: [provider],
+			excludeTools: ["decompress"],
+			capabilityCeiling: { version: 1, allowedTools: ["read", "compress", "decompress", "search_context"], sources: ["local"] },
+			inheritedCapabilityCeiling: { version: 1, allowedTools: ["read", "compress", "decompress", "acp_status"], sources: ["parent"] },
+		});
+		assert.deepEqual(plan.effectiveToolAllowlist, ["read", "compress"]);
+		assert.deepEqual(plan.requiredChildTools, ["read", "compress"]);
+		assert.deepEqual(plan.capabilityAudit?.removedTools, ["decompress", "search_context", "acp_status", "fixture_lookup"]);
+		assert.deepEqual(plan.unavailableHostBuiltins, []);
+		assert.deepEqual(plan.configuredExtensions, [provider]);
+	});
+
+	it("denyExtensions removes external names and providers, not builtins or native coordination", () => {
+		for (const hostAvailableBuiltins of [undefined, ["read", "ipython"]]) {
+			const plan = resolvePiLaunchToolPlan({
+				tools: ["read", "ipython", ...extensionTools, "contact_supervisor", "subagent", "subagent_supervisor", provider],
+				hostAvailableBuiltins,
+				extensions: [provider],
+				subagentOnlyExtensions: [provider],
+				inheritedCapabilityCeiling: { version: 1, denyExtensions: true, sources: ["parent"] },
+			});
+			const expected = ["read", ...(hostAvailableBuiltins ? ["ipython"] : []), "contact_supervisor", "subagent", "subagent_supervisor"];
+			assert.deepEqual(plan.effectiveToolAllowlist, expected);
+			assert.deepEqual(plan.requiredChildTools, expected.filter((tool) => tool !== "contact_supervisor"));
+			assert.deepEqual(plan.configuredExtensions, []);
+			assert.deepEqual(plan.toolExtensionPaths, []);
+			assert.equal(plan.extensionArgs.includes(provider), false);
+			assert.equal(plan.disableAmbientExtensions, true);
+			assert.deepEqual(plan.unavailableHostBuiltins, []);
+		}
+	});
+
+	it("provider paths and ceiling-only names do not become explicit tool requests", () => {
+		for (const tools of [undefined, [], [provider], ["read"]]) {
+			const plan = resolvePiLaunchToolPlan({
+				tools, hostAvailableBuiltins: ["read"], extensions: [provider],
+				capabilityCeiling: { version: 1, allowedTools: ["read", ...extensionTools], sources: ["test"] },
+			});
+			assert.equal(plan.effectiveToolAllowlist.some((name) => extensionTools.includes(name)), false);
+			assert.equal(plan.requiredChildTools.some((name) => extensionTools.includes(name)), false);
+		}
+	});
+
+	it("passes the same explicit authorization and requirements to foreground and runner sessions", () => {
+		for (const host of ["parent", "runner"] as const) {
+			const launch = buildInProcessChildLaunch({
+				...input, subagentOnlyExtensions: [provider], host, cwd: os.tmpdir(),
+				childAgentName: "fixture", childIndex: 0, sessionEnabled: false,
+				inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,
+			});
+			assert.deepEqual(launch.session.tools, input.tools);
+			assert.deepEqual(launch.config.requiredTools, input.tools);
+			assert.deepEqual(launch.session.extensionPaths, [provider]);
+			assert.equal(launch.session.ambientExtensions, host === "runner");
+		}
+	});
+});
+
 describe("production launch path supplies hostAvailableBuiltins", () => {
 	it("buildInProcessChildLaunch passes hostAvailableBuiltins to tool plan resolution", () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-launch-builtins-"));
