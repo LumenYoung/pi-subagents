@@ -126,6 +126,74 @@ describe("child tool plan declared tools", () => {
 	});
 });
 
+describe("child tool plan explicit extension authorization", () => {
+	const extensionTools = ["compress", "decompress", "search_context", "acp_status", "fixture_lookup"];
+	const tools = ["read", ...extensionTools];
+	const provider = "/fixture/provider.ts";
+
+	it("preserves named tools independently of how their child provider is configured", () => {
+		for (const providerInput of [{}, { extensions: [provider] }, { subagentOnlyExtensions: [provider] }, { tools: [...tools, provider] }]) {
+			const plan = resolvePiLaunchToolPlan({ tools, ...providerInput });
+			assert.deepEqual(plan.effectiveToolAllowlist, tools);
+			assert.deepEqual(plan.requiredChildTools, tools);
+			assert.deepEqual(plan.warnings, []);
+			assert.equal(plan.configuredExtensions.includes(provider), Object.keys(providerInput).length > 0);
+		}
+	});
+
+	it("intersects inherited ceilings and applies exclusions to explicit extension names", () => {
+		const plan = resolvePiLaunchToolPlan({
+			tools, extensions: [provider], excludeTools: ["decompress"],
+			capabilityCeiling: { version: 1, allowedTools: ["read", "compress", "decompress", "search_context"], sources: ["local"] },
+			inheritedCapabilityCeiling: { version: 1, allowedTools: ["read", "compress", "decompress", "acp_status"], sources: ["parent"] },
+		});
+		assert.deepEqual(plan.effectiveToolAllowlist, ["read", "compress"]);
+		assert.deepEqual(plan.requiredChildTools, ["read", "compress"]);
+		assert.deepEqual(plan.capabilityAudit?.removedTools, ["decompress", "search_context", "acp_status", "fixture_lookup"]);
+		assert.deepEqual(plan.configuredExtensions, [provider]);
+	});
+
+	it("denyExtensions removes all provider routes but retains named child requirements", () => {
+		const plan = resolvePiLaunchToolPlan({
+			tools: [...tools, provider], extensions: [provider], subagentOnlyExtensions: [provider],
+			inheritedCapabilityCeiling: { version: 1, denyExtensions: true, sources: ["parent"] },
+		});
+		assert.deepEqual(plan.effectiveToolAllowlist, tools);
+		assert.deepEqual(plan.requiredChildTools, tools);
+		assert.deepEqual(plan.configuredExtensions, []);
+		assert.deepEqual(plan.toolExtensionPaths, []);
+		assert.equal(plan.extensionArgs.includes(provider), false);
+		assert.equal(plan.disableAmbientExtensions, true);
+	});
+
+	it("uses a ceiling as an allowlist only when tools is omitted, without adding providers", () => {
+		for (const requested of [undefined, [], [provider], ["read"]]) {
+			const plan = resolvePiLaunchToolPlan({
+				tools: requested, excludeTools: ["decompress"],
+				capabilityCeiling: { version: 1, allowedTools: tools, sources: ["test"] },
+			});
+			const expected = requested === undefined ? tools.filter((name) => name !== "decompress") : requested.filter((name) => name !== provider);
+			assert.deepEqual([...plan.effectiveToolAllowlist].sort(), [...expected].sort());
+			assert.deepEqual([...plan.requiredChildTools].sort(), requested === undefined ? [] : [...expected].sort());
+			assert.deepEqual(plan.configuredExtensions, requested?.includes(provider) ? [provider] : []);
+		}
+	});
+
+	it("passes identical explicit requirements and providers to foreground and runner sessions", () => {
+		for (const host of ["parent", "runner"] as const) {
+			const launch = buildInProcessChildLaunch({
+				tools, subagentOnlyExtensions: [provider], host, cwd: os.tmpdir(),
+				childAgentName: "fixture", childIndex: 0, sessionEnabled: false,
+				inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false,
+			});
+			assert.deepEqual(launch.session.tools, tools);
+			assert.deepEqual(launch.config.requiredTools, tools);
+			assert.deepEqual(launch.session.extensionPaths, [provider]);
+			assert.equal(launch.session.ambientExtensions, host === "runner");
+		}
+	});
+});
+
 describe("production launch path keeps declared child tools", () => {
 	it("buildInProcessChildLaunch requires every declared tool from the child registry", () => {
 		const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-launch-builtins-"));
